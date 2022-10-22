@@ -11,13 +11,14 @@
 (struct FunDefC ([name : Symbol] [args : (Listof Symbol)] [body : ExprC]) #:transparent)
 (struct LamC ([args : (Listof Symbol)] [body : ExprC]) #:transparent)
 
-
-(struct Binding ([name : Symbol] [val : Value]) #:transparent)
-(define-type Env (Listof Binding))
-(define mt-env '())
-(define extend-env cons)
 (define-type Value (U Real Boolean String CloV))
 (struct CloV ([params : (Listof Symbol)] [body : ExprC] [env : Env]) #:transparent)
+(struct PrimopV ())
+(define-type Env (Listof Binding))
+(struct Binding ([name : Symbol] [val : Value]) #:transparent)
+(define mt-env '())
+(define extend-env cons)
+
 
 (define symbol-to-op (make-immutable-hash
  (list (cons '+ +)
@@ -48,8 +49,8 @@
 ;                                           (interp a env))
 ;                                     (CloV-env fd)))])]))
 (define (interp [exp : ExprC] [env : Env]) : Value
-  ;(displayln exp)
-  ;(displayln env) 
+  (displayln exp)
+  (displayln env) 
   (match exp
     [(NumC n) n]
     [(IdC name) (lookup env name)]
@@ -57,14 +58,11 @@
     [(AppC f a) (define fd (interp f env))
                   (match fd
                     [(CloV params body env)
-                      (define argvals ((inst map Binding ExprC Symbol) (lambda (arg var) (Binding var (interp arg env))) a (CloV-params fd)))
-                      argvals
-                      (displayln (map (lambda (arg) (extend-env arg (CloV-env fd))) argvals))
-                      (displayln (list (Binding 'b 10) (Binding 'z 2)))
-                      (displayln argvals)
-                      (interp (CloV-body fd) argvals)])]))
+                      (define new-env ((inst map Binding ExprC Symbol) (lambda (arg var) (Binding var (interp arg env))) a (CloV-params fd)))
+                      (interp (CloV-body fd) ((inst foldl Binding Env) cons new-env (CloV-env fd)))])]))
 
 (interp (AppC (LamC '(a b) (IdC 'a)) (list (NumC 3) (NumC 10))) mt-env)
+(cons (Binding 'a 111) (list (Binding 'b 10) (Binding 'z 2)))
 
 ; (define (top-interp [s : Sexp]) : String
 ;  (serialize (interp (parse s) top-env)))
