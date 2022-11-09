@@ -10,7 +10,8 @@
 (struct LamC ([args : (Listof TySymbol)] [body : ExprC]) #:transparent)
 (struct IfC ([if : ExprC] [then : ExprC] [else : ExprC]) #:transparent)
 (struct StringC ([val : String]) #:transparent)
-(struct RecC ([fun : Symbol] [args : (Listof TySymbol)] [use : ExprC] [retT : Ty] [body : ExprC]) #:transparent)
+(struct RecC ([fun : Symbol] [args : (Listof Symbol)] [argsT : (Listof Ty)]  [use : ExprC] [retT : Ty]
+                             [body : ExprC]) #:transparent)
 
 (define-type Value (U Real Boolean String CloV PrimopV))
 (struct PrimopV ([op : Symbol]))
@@ -54,11 +55,14 @@
        (cons 'vars: #f)
        (cons 'body: #f)
        (cons 'proc #f)
+       (cons ': #f)
+       (cons 'rec #f)
        (cons 'go #f))))
 
 ; Combines parsing and evaluation
 (define (top-interp [s : Sexp]) : String
- (serialize (interp (parse s) top-env)))
+  (type-check (parse s) base-tenv)
+  (serialize (interp (parse s) top-env)))
 
 ; Interprets an expression with an environment
 (define (interp [exp : ExprC] [env : Env]) : Value
@@ -68,22 +72,18 @@
     [(IdC name) (unbox (lookup env name))]
     [(LamC a b) (CloV (map (lambda (x) (TySymbol-arg x)) a) b env)]
     [(IfC c t e) (cond
-                      [(not (boolean? (interp c env))) (error 'interp "not a valid condition ~e (JYSS)" c)]
                       [(interp c env) (interp t env)]
                       [else (interp e env)])]
     [(AppC f a) (define fd (interp f env))
                   (match fd
                     [(PrimopV op) (primop-eval op ((inst map Value ExprC) (lambda (x) (interp x env)) a) env)]
                     [(CloV params body e)
-                      (cond
-                        [(not (equal? (length a) (length (CloV-params fd))))
-                          (error 'interp "argument list and parameter list not equal size (JYSS)")])
                       (define new-env ((inst map Binding ExprC Symbol)
                                        (lambda (arg var) (Binding var (box (interp arg env)))) a params))
-                      (interp body (append new-env e))]
-                    [other (error 'interp "bad syntax ~e (JYSS)" exp)])]
-    [(RecC f a u r b) (define dummy-env (cons (Binding f (box -1)) env))
-                      (set-box! (lookup dummy-env f) (CloV (map (lambda (x) (TySymbol-arg x)) a) u dummy-env))
+                      (interp body (append new-env e))])]
+                    ;[other (error 'interp "bad syntax ~e (JYSS)" exp)])]
+    [(RecC f a at u r b) (define dummy-env (cons (Binding f (box -1)) env))
+                      (set-box! (lookup dummy-env f) (CloV a u dummy-env))
                       (interp b dummy-env)]))
 
 ; Parses an s-expression
@@ -96,19 +96,24 @@
                        [else (error 'parse "not a valid argument ~e (JYSS)" val)])]
     [(list (? symbol? name) `= value) (parse value)]
     [(list `if if then else) (IfC (parse if) (parse then) (parse else))]
-    ;[(list `vars: vars ... `body: body) (desugar (cast vars (Listof Sexp)) body)] 
-    ;[(list `proc (list (? symbol? s) args ...) `go body)
-    ;      (cond [(false? (check-duplicates (cons s args))) (LamC (cast (cons s args) (Listof Symbol)) (parse body))]
-    ;            [else (error 'parse "two or more parameters with same identifier ~e (JYSS)" args)])]
+    [(list 'vars: (list (? symbol? s) ': ty '= exprs) ... 'body: body)
+     (desugar (cast s (Listof Symbol))(cast ty (Listof Sexp)) (cast exprs (Listof Sexp)) body)] 
     [(list 'proc (list (list (? symbol? s) ': ty) ...) 'go body)
        (cond [(false? (check-duplicates s))
                 (define types ((inst map Ty Sexp) (lambda (t) (parse-type t)) (cast ty (Listof Sexp))))
                 (LamC ((inst map TySymbol Symbol Ty)
                        (lambda (arg type) (TySymbol arg type)) (cast s (Listof Symbol)) types) (parse body))]
              [else (error 'parse "two or more parameters with same identifier ~e (JYSS)" s)])]
-      ; (println s) (println ty) (println body)(NumC 1)]
-    [(list `proc (list) `go body) (LamC (list) (parse body))]
     [(list (? symbol? op) a b) (AppC (IdC op) (list (parse a) (parse b)))]
+    [(list 'rec: (list (? symbol? s) `= (list 'proc (list (list (? symbol? id) ': ty) ...) ': retT 'go proc-body))
+           'in body)
+       (define tys ((inst map Ty Sexp) (lambda (t) (parse-type t)) (cast ty (Listof Sexp))))
+       (RecC s
+             (cast id (Listof Symbol))
+             tys
+             (parse proc-body)
+             (parse-type retT)
+             (parse body))]
     [(list a b ...) (AppC (parse a) ((inst map ExprC Sexp) parse b))]))
 
 (define (parse-type [sexp : Sexp]) : Ty
@@ -116,22 +121,22 @@
     ['num (NumT)]
     ['str (StrT)]
     ['bool (BoolT)]
-    [(list tys ... '-> ret) (FunT ((inst map Ty Sexp) (lambda (x) (parse-type x)) (cast tys (Listof Sexp))) (parse-type ret))]
+    [(list tys ... '-> ret) (FunT ((inst map Ty Sexp) (lambda (x) (parse-type x)) (cast tys (Listof Sexp)))
+                                  (parse-type ret))]
     [other (error 'parse-type "bad type ~e (JYSS)" sexp)]))
 
-(check-equal? (parse '{proc {[z : num] [y : num]} go {+ z y}}) (LamC (list (TySymbol 'z (NumT)) (TySymbol 'y (NumT))) (AppC (IdC '+) (list (IdC 'z) (IdC 'y)))))
-
 ; Desugars local variable definitions into ExprC
-;(define (desugar [vars : (Listof Sexp)] [body : Sexp]) : ExprC
-;  (define args (for/list ([var vars]) : (Listof Symbol) (cast (first (cast var (Listof Any))) Symbol)))
-;  (for/or ([arg args]) : Boolean #:break (not (hash-has-key? reserved-ids arg))
-;    (error 'parse "not valid syntax ~e (JYSS)" args))
-;  (cond
-;    [(false? (check-duplicates args))
-;      (AppC
-  ;     (LamC args (parse body))
-;       (for/list [(var vars)] (parse (cast (third (cast var (Listof Any))) Sexp))))]
- ;   [else (error 'desugar "bad syntax for arguments ~e (JYSS)" vars)]))
+(define (desugar [vars : (Listof Symbol)] [types : (Listof Sexp)] [def : (Listof Sexp)] [body : Sexp]) : ExprC
+  (for/or ([arg vars]) : Boolean #:break (not (hash-has-key? reserved-ids arg))
+    (error 'parse "not valid syntax ~e (JYSS)" vars))
+  (cond
+    [(false? (check-duplicates vars))
+      (define tys ((inst map Ty Sexp) (lambda (t) (parse-type t)) types))
+      (AppC
+       (LamC ((inst map TySymbol Symbol Ty) (lambda (arg type) (TySymbol arg type)) vars tys)
+             (parse body))
+       (map (lambda (b) (parse b)) def))]
+    [else (error 'desugar "bad syntax for arguments ~e (JYSS)" vars)]))
 
 ; Looksup a symbol's value in a given environment
 (define (lookup [env : Env] [name : Symbol]) : (Boxof Value)
@@ -144,7 +149,7 @@
 ; Looksup a symbol's type in a given type environment
 (define (lookup-type [env : TEnv] [name : Symbol]) : Ty
   (match env
-    ['() (error 'lookup "name not found: ~e (JYSS)" name)]
+    ['() (error 'lookup-type "name not found: ~e (JYSS)" name)]
     [(cons (BindingTy n val) r) (cond
                       [(equal? n name) val]
                       [else (lookup-type r name)])]))
@@ -196,6 +201,7 @@
 (define (type-check [expr : ExprC] [tenv : TEnv]) : Ty
   (match expr
     [(NumC n) (NumT)]
+    [(StringC s) (StrT)]
     [(IdC s) (lookup-type tenv s)]
     [(IfC c t e) (cond
                    [(not (equal? (BoolT) (type-check c tenv)))
@@ -212,63 +218,92 @@
                     [(not (FunT? ft))
                      (error 'type-check "not a function ~e" f)]
                     [(not (equal? (FunT-args ft) at))
-                     (error 'type-check  "app arg mismatch ~e" a)]
+                     (error 'type-check  "app arg mismatch ~e ~e" a ft)]
                     [else (FunT-ret ft)])]
-    [(RecC f a u r b) (define new-tenv (cons (BindingTy f (FunT (map (lambda (x) (TySymbol-type x)) a) r)) tenv))
-                      (define body-tenv (append ((inst map BindingTy TySymbol)
-                                           (lambda (bt) (BindingTy (TySymbol-arg bt) (TySymbol-type bt))) a) new-tenv))
-                      (cond
-                        [(not (equal? r (type-check b body-tenv)))
-                         (error 'type-check "body return type not correct ~e" b)]
-                        [else (type-check u new-tenv)])]))
+    [(RecC f a at u r b) (define new-tenv (cons (BindingTy f (FunT at r)) tenv))
+                         (define body-tenv ((inst map BindingTy Symbol Ty)
+                                            (lambda (arg type) (BindingTy arg type)) a at))
+                         (cond
+                           [(not (equal? r (type-check u (append body-tenv new-tenv))))
+                            (error 'type-check "body return type not correct ~e" u)]
+                           [else (type-check b new-tenv)])]))
 
-(check-exn (regexp (regexp-quote "primop-eval: user-error '(\"1234\")"))
-           (lambda () (primop-eval 'error (list "1234") top-env)))
 (check-equal? (parse '"sample") (StringC "sample"))
 (check-equal? (parse '{f = 2}) (NumC 2))
 (check-equal? (parse '{if x 10 1}) (IfC (IdC 'x) (NumC 10) (NumC 1)))
-(check-equal? (parse '{proc {[z : int] [y : int]} go {+ z y}}) (LamC (list (TySymbol 'z (NumT)) (TySymbol 'y (NumT))) (AppC (IdC '+) (list (IdC 'z) (IdC 'y)))))
+(check-equal? (parse '{proc {[z : num] [y : num]} go {+ z y}})
+              (LamC (list (TySymbol 'z (NumT)) (TySymbol 'y (NumT))) (AppC (IdC '+) (list (IdC 'z) (IdC 'y)))))
 (check-equal? (parse '{{g} 15}) (AppC (AppC (IdC 'g) '()) (list (NumC 15))))
+(check-equal? (parse-type 'str) (StrT))
+(check-equal? (parse-type 'bool) (BoolT))
+(check-equal? (parse-type '{num num -> num}) (FunT (list (NumT) (NumT)) (NumT)))
+(check-equal? (top-interp
+'{rec: [square-helper =
+       {proc {[n : num]} : num go
+         {if {<= n 0} 0 {+ n {square-helper {- n 2}}}}}]
+ in
+ {vars: [square : {num -> num}  =
+         {proc {[n : num]} go {square-helper {- {* 2 n} 1}}}]
+  body:
+  {square 13}}}) "169")
+(check-exn (regexp (regexp-quote "type-check: body return type not correct (IfC (AppC (IdC '<=)
+                                                                        (list (IdC 'n) (NumC 0))) (NumC 0) (NumC 5))"))
+           (lambda () (type-check (parse '{rec: [square-helper =
+                                                 {proc {[n : num]} : str go
+                                                  {if {<= n 0} 0 5}}]
+                                           in "wrong"}) base-tenv)))
+(check-exn (regexp (regexp-quote "parse-type: bad type 'st (JYSS)"))
+           (lambda () (parse-type 'st)))
+(check-exn (regexp (regexp-quote  "desugar: bad syntax for arguments '(z z) (JYSS)"))
+           (lambda () (parse '(vars: (z : num = (proc () go 3)) (z : num = 9) body: (z)))))
 (check-exn (regexp (regexp-quote "parse: not valid syntax '(go) (JYSS)"))
-           (lambda () (parse '(vars: (go = "") body: "World"))))
+           (lambda () (parse '{vars: {go : str = ""} body: "World"})))
 (check-exn (regexp (regexp-quote "parse: not a valid argument 'if (JYSS)"))
            (lambda () (parse '{+ if 4})))
-(check-exn (regexp (regexp-quote "two or more parameters with same identifier '(x) (JYSS)"))
-           (lambda () (parse '{proc {x x} go 3})))
-(check-exn (regexp (regexp-quote "desugar: bad syntax for arguments '((z = (proc () go 3)) (z = 9)) (JYSS)"))
-           (lambda () (parse '(vars: (z = (proc () go 3)) (z = 9) body: (z)))))
+(check-exn (regexp (regexp-quote "parse: two or more parameters with same identifier '(x x) (JYSS)"))
+           (lambda () (parse '{proc {[x : num] [x : num]} go 3})))
 (check-equal? (top-interp (quote (if true + -))) "#<primop>")
 (check-equal? (top-interp (quote (if false + -))) "#<primop>")
-(check-equal? (top-interp (quote (if (<= 4 3) 29387 true))) "true")
-(check-exn (regexp (regexp-quote "interp: not a valid condition (AppC (IdC '+) (list (NumC 4) (NumC 3))) (JYSS)"))
+(check-equal? (top-interp (quote (if (<= 4 3) 29387 1))) "1")
+(check-equal? (interp (StringC "ram") '()) "ram")
+(check-exn (regexp
+            (regexp-quote "type-check: condition is not a boolean (AppC (IdC '+) (list (NumC 4) (NumC 3))) (JYSS)"))
            (lambda () (top-interp '(if (+ 4 3) 7 8))))
+(check-exn (regexp (regexp-quote "type-check: then and else clauses are different types (StringC \"dsf\") (NumC 8)"))
+           (lambda () (top-interp '(if true "dsf" 8))))
 (check-exn (regexp (regexp-quote "primop-eval: divide by zero (JYSS)"))
            (lambda () (top-interp '(/ 1 (+ -3 3)))))
 (check-exn (regexp (regexp-quote "primop-eval: divide by zero (JYSS)"))
            (lambda () (top-interp '(/ 1 (+ -3 3)))))
-(check-exn (regexp (regexp-quote "interp: bad syntax (AppC (NumC 3) (list (NumC 4) (NumC 5))) (JYSS)"))
+(check-exn (regexp (regexp-quote "type-check: not a function (NumC 3)"))
            (lambda () (top-interp '(3 4 5))))
-(check-exn (regexp (regexp-quote "primop-eval: user-error '(\"1234\")"))
-           (lambda () (top-interp '(+ 4 (error "1234")))))
 (check-equal? (primop-eval '- (list 1 2) top-env) -1)
 (check-equal? (primop-eval '* (list 1 2) top-env) 2)
 (check-equal? (primop-eval '/ (list 4 2) top-env) 2)
 (check-equal? (primop-eval 'true '() top-env) #t)
 (check-equal? (primop-eval 'false '() top-env) #f)
-(check-equal? (primop-eval 'equal? (list 3 3) top-env) #t)
-(check-equal? (primop-eval 'equal? (list 3 4) top-env) #f)
+(check-equal? (primop-eval 'num-eq? (list 3 3) top-env) #t)
+(check-equal? (primop-eval 'num-eq? (list 3 4) top-env) #f)
+(check-equal? (primop-eval 'str-eq? (list "str" "str") top-env) #t)
+(check-equal? (primop-eval 'substring (list "random" 1 3) top-env) "an")
 (check-exn (regexp (regexp-quote "lookup: name not found: 'f (JYSS)"))
            (lambda () (lookup '() 'f)))
+(check-exn (regexp (regexp-quote "lookup-type: name not found: 'some (JYSS)"))
+           (lambda () (lookup-type '() 'some)))
 (check-exn (regexp (regexp-quote "primop-eval: wrong number of arguments '(1 2 3) (JYSS)"))
            (lambda () (primop-eval '- (list 1 2 3) top-env)))
 (check-exn (regexp (regexp-quote "primop-eval: invalid operator/arguments '! (JYSS)"))
            (lambda () (primop-eval '! (list 1 2) top-env)))
 (check-exn (regexp (regexp-quote "primop-eval: wrong number of arguments: '(1 \"f\" 4) (JYSS)"))
-           (lambda () (primop-eval 'equal? (list 1 "f" 4) top-env)))
-(check-equal? (top-interp '{vars: [z = {+ 2 13}] [y = 98] body: {+ z y}}) "113")
+           (lambda () (primop-eval 'num-eq? (list 1 "f" 4) top-env)))
+(check-exn (regexp (regexp-quote "primop-eval: wrong number of arguments: '(\"s\" \"f\" \"r\") (JYSS)"))
+           (lambda () (primop-eval 'str-eq? (list "s" "f" "r") top-env)))
+(check-exn (regexp (regexp-quote "primop-eval: type mismatch in arguments \"s\" \"1\" 3"))
+           (lambda () (primop-eval 'substring (list "s" "1" 3) top-env)))
+(check-equal? (top-interp '{vars: [z : num = {+ 2 13}] [y : num = 98] body: {+ z y}}) "113")
 (check-equal? (top-interp '{proc () go 9}) "#<procedure>")
-(check-exn (regexp (regexp-quote "interp: argument list and parameter list not equal size (JYSS)"))
-           (lambda () (top-interp '((proc () go 9) 17))))
+(check-exn (regexp (regexp-quote "type-check: app arg mismatch (list (NumC 17))"))
+           (lambda () (top-interp '{{proc {} go 9} 17})))
 (check-equal? (serialize #f) "false")
 (check-equal? (serialize #t) "true")
 (check-equal? (serialize "random") "\"random\"")
